@@ -1,0 +1,219 @@
+#!/bin/bash
+
+# Simple alias functions
+PROCYON_VERSION="0.5.34"
+PLAYSTORE_DOWNLOADER_PATH="$HOME/.bb/MobSec/Android/PlaystoreDownloader"
+APKTOOL_VERSION="2.11.0-9-7f7ca8f3-SNAPSHOT"
+
+APKTOOL_PATH="$HOME/.bb/MobSec/Android/Apktool"
+JADX_PATH="$HOME/.bb/MobSec/Android/jadx"
+
+alias apktool="java -jar ${APKTOOL_PATH}/brut.apktool/apktool-cli/build/libs/apktool-v${APKTOOL_VERSION}.jar"
+alias jadx="JADX_OPTS='-Xmx16G' $HOME/.bb/MobSec/Android/jadx/build/jadx/bin/jadx --no-res --threads-count 12 --deobf --deobf-min 3 --deobf-use-sourcename --show-bad-code --escape-unicode"
+function update_apktool() {
+    (cd ${APKTOOL_PATH} && git pull && ./gradlew build shadowJar proguard)
+    APKTOOL_VERSION=$(basename $(ls ${APKTOOL_PATH}/brut.apktool/apktool-cli/build/libs/apktool-v*.jar) | sed -r 's/apktool-v(.*)\.jar/\1/')
+    sed -i -e 's/^APKTOOL_VERSION="[^"]+"$/APKTOOL_VERSION="'$APKTOOL_VERSION'"/' $HOME/.bb/Tools/mobsec/apk_utils.sh
+    echo "Updated APKTool to version $APKTOOL_VERSION"
+}
+
+function update_jadx() {
+    (cd ${JADX_PATH} && git pull && ./gradlew dist)
+}
+
+
+alias procyon="$(/usr/libexec/java_home -v 1.8)/bin/java -jar $HOME/.bb/MobSec/Android/procyon-decompiler-$PROCYON_VERSION.jar -ss"
+alias enjarify="$HOME/.bb/MobSec/Android/enjarify-go/enjarify-rs/target/release/enjarify-rs"
+
+alias get_apk_schemas="$HOME/.bb/Tools/mobsec/get_schemas/get_schemas.py"
+alias APKEditor="java -jar ~/.bb/MobSec/Android/APKEditor/build/libs/APKEditor-1.3.5.jar"
+
+alias snapshotemu="adb emu avd snapshot save default_boot"
+
+alias recaf="open $HOME/.bb/MobSec/Android/Recaf/target/recaf-2.21.13-J8-jar-with-dependencies.jar"
+
+export PATH="$HOME/Library/Android/sdk/build-tools/29.0.2/:${PATH}"
+
+# decompiles all APKs in a directory
+function apk_decompile_all() {
+    FILTER=$(find . -maxdepth 1 -type f -name "*.apk" | head -1)
+    if [[ ! -z "$FILTER" ]]; then
+        for apk in *.apk; do
+            apktool d -s "$apk"
+            jadx --output-dir-src "${apk%.*}/src" "$apk"
+        done
+    else
+        echo "You must download some APKs here first!"
+    fi
+}
+
+# decompiles a single APK
+function apk_decompile_one() {
+    if [[ "$#" -eq 1 ]]; then
+        APKFILE="$1"
+
+        if [[ -s "$APKFILE" ]]; then
+            apktool d -s "$APKFILE"
+            jadx --output-dir-src "${APKFILE%.*}/src" "$APKFILE"
+        else
+            echo "Error: APK File does not exist - ${APKFILE}"
+        fi
+    fi
+}
+
+# downloads an APK with gplaycli or PlaystoreDownloader
+function apk_download() {
+    if [[ "$#" -lt 1 ]]; then
+        echo "Usage: apk_download <com.package.name> [playstore-arm (default)/playstore-x86/playstore-arm64/gplaycli]"
+        return 1
+    fi
+
+    DOWNLOADER="${2:-playstore-arm}"
+    PKGNAME="$1"
+    APKFILE="$PKGNAME.apk"
+
+
+    echo "[+] Downloading $PKGNAME APK using $DOWNLOADER..."
+    # download APK
+    case $DOWNLOADER in
+        gplaycli )
+            gplaycli -c ~/.config/gplaycli/gplaycli.conf -pd "$PKGNAME";;
+        playstore-arm )
+            python3 "$PLAYSTORE_DOWNLOADER_PATH/download.py" \
+                -c "$PLAYSTORE_DOWNLOADER_PATH/credentials_arm.json" \
+                -o "$APKFILE" "$PKGNAME";;
+        playstore-arm64 )
+            python3 "$PLAYSTORE_DOWNLOADER_PATH/download.py" \
+                -c "$PLAYSTORE_DOWNLOADER_PATH/credentials_arm64.json" \
+                -o "$APKFILE" "$PKGNAME";;
+        playstore-x86 )
+            python3 "$PLAYSTORE_DOWNLOADER_PATH/download.py" \
+                -c "$PLAYSTORE_DOWNLOADER_PATH/credentials_x86.json" \
+                -o "$APKFILE" "$PKGNAME";;
+        * )
+            echo "[!] Error: unsupported downloader"
+            return 1;;
+    esac
+
+    if [[ ! -s "$APKFILE" ]]; then
+        echo "[!] Error downloading APK"
+        return 1
+    fi
+
+    # get version number
+    apk_rename $APKFILE >/dev/null
+
+    echo "[+] Done! Downloaded to $(basename $APK_RENAME_OUTPATH)"
+}
+
+
+# pulls an APK off a phone over ADB, works with split APKs too
+function apk_pull() {
+    if [[ "$#" -ne 1 ]]; then
+        echo "Usage: apk_pull <com.package.name>"
+        return 1
+    fi
+
+    PKGNAME="$1"
+    OUTPUT_PATH="${PKGNAME}_adb.apk"
+    PKG_FILES=$(adb shell pm path $PKGNAME | gsed -r 's/package:(.*\.apk)$/\1/g')
+    if [[ "$(echo $PKG_FILES | wc -l)" -eq 1 ]]; then
+        adb pull "$PKG_FILES" "$OUTPUT_PATH"
+    else
+        echo "[+] Split APK detected, pulling all parts and merging with APKEditor..."
+        OUTPUT_PATH="${PKGNAME}_merged.apk"
+        TEMPDIR=$(mktemp -d -t $PKGNAME)
+        echo $PKG_FILES | xargs -L 1 -I {} adb pull {} $TEMPDIR/
+        APKEditor m -i $TEMPDIR -o $OUTPUT_PATH
+        rm -rf $TEMPDIR
+    fi
+
+    apk_rename $OUTPUT_PATH
+    echo "[+] Downloaded $PKGNAME APK to $APK_RENAME_OUTPATH"
+}
+
+# renames an APK to the com.package.name-version.apk
+function apk_rename() {
+    unset APK_RENAME_OUTPATH
+    if [[ "$#" -ne 1 ]]; then
+        echo "Usage: apk_rename /path/to/file.apk"
+        return 1
+    fi
+
+    APKFILE="$1"
+    if [[ ! -f "$APKFILE" ]]; then
+        echo "[!] Input file not found"
+        return 1
+    fi
+
+    APKPATH="$(realpath $APKFILE)"
+    APKDIR="$(dirname $APKPATH)"
+    PKGNAME="$(aapt2 dump packagename $APKFILE 2>/dev/null)"
+    if [[ -z "$PKGNAME" ]]; then
+        echo "[!] Unable to get package name from input file"
+        return 1
+    fi
+
+    VERSION="$(aapt dump badging $APKFILE 2>&1 | sed -En "s/.*versionName='([^']+)'.*/\1/p")"
+    if [[ -z "$VERSION" ]]; then
+        echo "[!] Unable to get version from input file"
+        return 1
+    fi
+
+    OUTPATH="$APKDIR/$PKGNAME-$VERSION.apk"
+
+    if [[ -f "$OUTPATH" ]]; then
+        CURRENT_FILE_HASH=$(openssl md5 -r $OUTPATH | awk '{print $1}')
+        INPUT_FILE_HASH=$(openssl md5 -r $APKFILE | awk '{print $1}')
+
+        echo "Output file $OUTPATH already exists. (existing file md5: $CURRENT_FILE_HASH | input file md5: $INPUT_FILE_HASH)"
+        read yn"?Are you sure you want to overwrite this file? [Y/n] "
+        if [[ ! $yn =~ ^[Yy]$ ]]; then
+            echo "[!] Rename canceled"
+            return 1
+        fi
+        echo "[+] Overwriting..."
+    fi
+
+    mv "$APKFILE" "$OUTPATH"
+
+    echo "[+] Renamed $APKFILE APK to $OUTPATH"
+
+    export APK_RENAME_OUTPATH=$OUTPATH
+}
+
+
+# runs adb logcatt for a specific package
+function adb_logcat_pkg() {
+    if [[ "$#" -ne 1 ]]; then
+        echo "Usage: adb_logcat_pkg <com.package.name>"
+        return 1
+    fi
+
+    PKGNAME="$1"
+    APP_PID=$(adb shell pidof -s "$PKGNAME")
+    if [[ ! -z "$APP_PID" ]]; then
+        adb logcat -b all -v color --pid="$APP_PID"
+    else
+        echo "[-] No PID found for a package: $PKGNAME"
+    fi
+}
+
+
+function playstore_open() {
+    if [[ "$#" -ne 1 ]]; then
+        echo "Usage: playstore_open <com.package.name>"
+        return 1
+    fi
+
+    adb shell am start -a android.intent.action.VIEW -d "market://details?id=$1"
+}
+
+function adb_open_url() {
+    if [[ "$#" -ne 1 ]]; then
+        echo "Usage: adb_open_url <link> [...]"
+        return 1
+    fi
+
+    adb shell am start -a android.intent.action.VIEW -d $@
+}
